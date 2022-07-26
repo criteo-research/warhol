@@ -165,7 +165,7 @@ class VQGanVAE(nn.Module):
         config = OmegaConf.load(config_path)
 
         model = instantiate_from_config(config["model"])
-
+        
         state = torch.load(model_path, map_location = 'cpu')['state_dict']
         model.load_state_dict(state, strict = False)
 

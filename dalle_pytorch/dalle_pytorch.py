@@ -319,8 +319,323 @@ class ModelLinear(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-# main WARHOL class
+####################
+# main TxtWARHOL class
+####################
+class TxtWARHOL(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        vae,
+        use_next_prod_module=False,
+        num_text_tokens = 10000,
+        text_seq_len = 256,
+        depth,
+        heads = 8,
+        dim_head = 64,
+        reversible = False,
+        attn_dropout = 0.,
+        ff_dropout = 0,
+        sparse_attn = False,
+        attn_types = None,
+        loss_img_weight = 7,
+        stable = False,
+        use_neg_samples = False
+    ):
+        super().__init__()
+        assert isinstance(vae, (DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE)), 'vae must be an instance of DiscreteVAE'
 
+        image_size = vae.image_size
+        num_image_tokens = vae.num_tokens
+        image_fmap_size = (vae.image_size // (2 ** vae.num_layers))
+        image_seq_len = image_fmap_size ** 2
+        num_text_tokens = num_text_tokens + text_seq_len  # reserve unique padding tokens for each position (text seq len)
+
+        self.text_emb = nn.Embedding(num_text_tokens, dim)
+        self.image_emb = nn.Embedding(num_image_tokens, dim)
+        
+        self.clip_txt_proj = nn.Linear(512, dim)
+        self.use_next_prod_module = use_next_prod_module
+        if self.use_next_prod_module:
+            self.next_product_proj = ModelLinear()
+        self.use_neg_samples = use_neg_samples
+        self.l2 = nn.MSELoss()
+        
+        self.text_pos_emb = nn.Embedding(text_seq_len, dim)
+        self.image_pos_emb = AxialPositionalEmbedding(dim, axial_shape = (image_fmap_size, image_fmap_size)) 
+        self.condition_pos_emb = nn.Embedding(1, dim)
+
+        self.num_text_tokens = num_text_tokens # for offsetting logits index and calculating cross entropy loss
+        self.num_image_tokens = num_image_tokens
+
+        self.text_seq_len = text_seq_len
+        self.image_seq_len = image_seq_len
+
+        seq_len = text_seq_len + image_seq_len
+        total_tokens = num_text_tokens + num_image_tokens
+        self.total_tokens = total_tokens
+        self.total_seq_len = seq_len
+
+        self.vae = vae
+        set_requires_grad(self.vae, False) # freeze VAE from being trained
+
+        self.transformer = Transformer(
+            dim = dim,
+            causal = True,
+            seq_len = seq_len,
+            depth = depth,
+            heads = heads,
+            dim_head = dim_head,
+            reversible = reversible,
+            attn_dropout = attn_dropout,
+            ff_dropout = ff_dropout,
+            attn_types = attn_types,
+            image_fmap_size = image_fmap_size,
+            sparse_attn = sparse_attn,
+            stable = stable
+        )
+
+        self.stable = stable
+
+        if stable:
+            self.norm_by_max = DivideMax(dim = -1)
+
+        self.to_logits = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, self.total_tokens),
+        )
+
+        seq_range = torch.arange(seq_len)
+        logits_range = torch.arange(total_tokens)
+
+        seq_range = rearrange(seq_range, 'n -> () n ()')
+        logits_range = rearrange(logits_range, 'd -> () () d')
+
+        logits_mask = (
+            ((seq_range >= text_seq_len) & (logits_range < num_text_tokens)) |
+            ((seq_range < text_seq_len) & (logits_range >= num_text_tokens))
+        )
+
+        self.register_buffer('logits_mask', logits_mask, persistent=False)
+        self.loss_img_weight = loss_img_weight
+
+
+    @torch.no_grad()
+    @eval_decorator
+    def generate_texts(
+        self,
+        clip_txt,
+        text=None,
+        *,
+        filter_thres = 0.5,
+        temperature = 1.
+    ):
+        device = clip_txt.device
+        
+        if self.use_next_prod_module:
+            clip_txt = self.next_clip_product(clip_txt)
+        
+        # Conditioning tokens
+        condition_tokens = self.clip_txt_proj(clip_txt)
+        condition_tokens += self.condition_pos_emb(torch.arange(1, device=device))
+        
+        text_seq_len = self.text_seq_len
+        if text is None or text == "":
+            text_tokens = None
+            len_init_txt = 0
+        else:
+            text_tokens = torch.tensor(tokenizer.tokenizer.encode(text)).cuda().unsqueeze(0)
+            len_init_txt = text_tokens.size(1)
+   
+        for _ in range(len_init_txt, text_seq_len):
+        
+            if text_tokens is not None: 
+                tokens = self.text_emb(text_tokens)
+                tokens += self.text_pos_emb(torch.arange(text_tokens.shape[1], device = device))
+                tokens = torch.cat((condition_tokens, tokens), dim = 1)
+            else:
+                tokens = condition_tokens
+
+            seq_len = tokens.shape[1]
+            output_transf = self.transformer(tokens)
+            if self.stable:
+                output_transf = self.norm_by_max(output_transf)
+            
+            # remove first output token which corresponds to the second input cond token
+            #output_transf = output_transf[:, 1:]
+            #seq_len -= 1
+            logits = self.to_logits(output_transf)
+            
+            logits_mask = self.logits_mask[:, :seq_len]
+            max_neg_value = -torch.finfo(logits.dtype).max
+            logits.masked_fill_(logits_mask, max_neg_value)
+            logits = logits[:, -1, :]
+
+            filtered_logits = top_k(logits, thres = filter_thres)
+            probs = F.softmax(filtered_logits / temperature, dim = -1)
+            sample = torch.multinomial(probs, 1)
+            
+            if text_tokens is None:
+                text_tokens = sample
+            else: 
+                text_tokens = torch.cat((text_tokens, sample), dim=-1)
+    
+        padding_tokens = set(np.arange(self.text_seq_len) + (self.num_text_tokens - self.text_seq_len))
+        texts = [tokenizer.tokenizer.decode(text_token, pad_tokens=padding_tokens) for text_token in text_tokens]
+        return text_tokens, texts
+
+    @torch.no_grad()
+    @eval_decorator
+    def generate_images(
+        self,
+        clip_txt,
+        text,
+        *,
+        clip = None,
+        mask = None,
+        filter_thres = 0.5,
+        temperature = 1.,
+        img = None,
+        num_init_img_tokens = None
+    ):
+        vae, text_seq_len, image_seq_len, num_text_tokens = self.vae, self.text_seq_len, self.image_seq_len, self.num_text_tokens
+        total_len = text_seq_len + image_seq_len
+        text = text[:, :text_seq_len] # make sure text is within bounds
+        out = text
+
+        for cur_len in range(out.shape[1], total_len):
+            is_image = cur_len >= text_seq_len
+            text, image = out[:, :text_seq_len], out[:, text_seq_len:]
+            logits = self(clip_txt, text, image=image, mask = mask)[:, -1, :]
+
+            filtered_logits = top_k(logits, thres = filter_thres)
+            probs = F.softmax(filtered_logits / temperature, dim = -1)
+            sample = torch.multinomial(probs, 1)
+
+            sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token
+            out = torch.cat((out, sample), dim=-1)
+
+            if out.shape[1] <= text_seq_len:
+                mask = F.pad(mask, (0, 1), value = True)
+
+        text_seq = out[:, :text_seq_len]
+        img_seq = out[:, -image_seq_len:]
+        images = vae.decode(img_seq)
+        if exists(clip):
+            scores = clip(text_seq, images, return_loss = False)
+            return images, scores
+
+        return images
+
+    def forward(
+        self,
+        clip_txt,
+        text,
+        image = None,
+        fut_clip=None, 
+        neg_clips=None,
+        mask = None,
+        return_loss = False
+    ):
+        
+        assert text.shape[-1] == self.text_seq_len, f'the length {text.shape[-1]} of the text tokens you passed in does not have the correct length ({self.text_seq_len})'
+        device, total_seq_len = text.device, self.total_seq_len
+        
+        if self.use_next_prod_module:
+            clip_txt = self.next_clip_product(clip_txt)
+            if self.use_neg_samples and return_loss:
+                clip_losses = self.get_clip_losses(fut_clip, clip_txt, neg_clips)
+        # Conditioning tokens
+        condition_tokens = self.clip_txt_proj(clip_txt)
+        condition_tokens += self.condition_pos_emb(torch.arange(1, device=device))
+
+        # make sure padding in text tokens get unique padding token id
+        text_range = torch.arange(self.text_seq_len, device = device) + (self.num_text_tokens - self.text_seq_len)
+        text = torch.where(text == 0, text_range, text)
+        tokens = self.text_emb(text)
+        tokens += self.text_pos_emb(torch.arange(text.shape[1], device = device))
+        tokens = torch.cat((condition_tokens, tokens), dim = 1)
+        seq_len = tokens.shape[1]
+        
+        if exists(image) and not is_empty(image):
+            is_raw_image = len(image.shape) == 4
+
+            if is_raw_image:
+                image_size = self.vae.image_size
+                assert tuple(image.shape[1:]) == (3, image_size, image_size), f'invalid image of dimensions {image.shape}'
+                image = self.vae.get_codebook_indices(image)
+
+            image_len = image.shape[1]
+            image_emb = self.image_emb(image)
+            image_emb += self.image_pos_emb(image_emb)
+            tokens = torch.cat((tokens, image_emb), dim = 1)
+            seq_len += image_len
+
+        # when training, if the length exceeds the total text + image length
+        # remove the last token, since it needs not to be trained
+        if tokens.shape[1] > total_seq_len: # there is one prepended cond tokens
+            seq_len -= 1
+            tokens = tokens[:, :-1]
+
+        out = self.transformer(tokens)
+        
+        if self.stable:
+            out = self.norm_by_max(out)
+    
+        logits = self.to_logits(out)
+        # mask logits to make sure text predicts text (except last token), and image predicts image
+        logits_mask = self.logits_mask[:, :seq_len]
+        max_neg_value = -torch.finfo(logits.dtype).max
+        logits.masked_fill_(logits_mask, max_neg_value)
+
+        if not return_loss:
+            return logits
+
+        assert exists(image), 'when training, image must be supplied'
+
+        offsetted_image = image + self.num_text_tokens
+        labels = torch.cat((text, offsetted_image), dim = 1)
+
+        logits = rearrange(logits, 'b n c -> b c n')
+
+        loss_text = F.cross_entropy(logits[:, :, :self.text_seq_len], labels[:, :self.text_seq_len])
+        loss_img = F.cross_entropy(logits[:, :, self.text_seq_len:], labels[:, self.text_seq_len:])
+        loss = (loss_text + self.loss_img_weight * loss_img) / (self.loss_img_weight + 1)
+        if self.use_next_prod_module and self.use_neg_samples:
+            return loss, clip_losses
+        return loss 
+    
+    
+    def next_clip_product(self, past_clip_txt):
+        new_clip_txt = self.next_product_proj(past_clip_txt)
+        new_clip_txt = new_clip_txt / new_clip_txt.norm(dim=-1, keepdim=True)
+        return new_clip_txt    
+    
+    def get_clip_losses(self, future, predicted_future, negatives):        
+        l2_loss = self.l2(future, predicted_future)
+
+        normed_prediction = predicted_future/ predicted_future.norm(dim=-1, keepdim=True)
+        normed_future = future/future.norm(dim=-1, keepdim=True)
+
+        cosine = -sum(torch.einsum("ij,ij->i",normed_prediction, normed_future))/len(future)
+        number_negs = negatives.shape[1]
+        repeated_prediction = einops.repeat(normed_prediction, 'b d -> b n d', n=number_negs)
+
+        positive_val = einops.repeat(torch.einsum("ij,ij->i",normed_prediction, normed_future), 'b -> b n', n=number_negs)
+        negative_val = torch.einsum("ijk,ijk->ij",negatives, repeated_prediction)
+        # https://github.com/criteo/deepr/blob/master/deepr/layers/bpr.py
+        bpr = torch.einsum("ij ->",-torch.nn.functional.logsigmoid(positive_val - negative_val))/len(future)/number_negs
+        return {"l2":l2_loss,
+                "negative_cosine":cosine,
+                "bpr":bpr}
+
+
+    
+    
+###################   
+# main WARHOL class
+###################
 class WARHOL(nn.Module):
     def __init__(
         self,
@@ -463,7 +778,6 @@ class WARHOL(nn.Module):
                 tokens = condition_tokens
 
             seq_len = tokens.shape[1]
-
             output_transf = self.transformer(tokens)
 
             if self.stable:
@@ -625,7 +939,6 @@ class WARHOL(nn.Module):
         logits = self.to_logits(out)
 
         # mask logits to make sure text predicts text (except last token), and image predicts image
-
         logits_mask = self.logits_mask[:, :seq_len]
         max_neg_value = -torch.finfo(logits.dtype).max
         logits.masked_fill_(logits_mask, max_neg_value)
@@ -677,7 +990,6 @@ class WARHOL(nn.Module):
 
 
 # original DALL-E class
-
 class DALLE(nn.Module):
     def __init__(
         self,

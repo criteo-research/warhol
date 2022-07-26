@@ -18,6 +18,8 @@ setup(
   install_requires=[
     'axial_positional_embedding',
     'DALL-E',
+    'numpy', 
+    'opencv-python',
     'einops>=0.3',
     'ftfy',
     'g-mlp-pytorch',
@@ -33,8 +35,8 @@ setup(
     'WebDataset', 
     'matplotlib', 
     'ipywidgets', 
-    'clip-anytorch', 
-    'basicsr==1.3.3.10'
+    'clip-anytorch',
+    'wandb'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

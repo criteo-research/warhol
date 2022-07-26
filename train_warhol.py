@@ -46,6 +46,9 @@ parser.add_argument('--ft_next_prod_module', dest='ft_next_prod_module', action=
 
 parser.add_argument('--inferring_clip_embeddings', dest='inferring_clip_embeddings', action='store_true')
 
+parser.add_argument('--use_of_clip_embed', type = str, default='', 
+    help = 'Define what CLIP embeddings do we use for conditioning: img, txt or both')
+
 parser.add_argument('--vqgan_model_path', type=str, default = None,
                    help='path to your trained VQGAN weights. This should be a .ckpt file. (only valid when taming option is enabled)')
 
@@ -58,10 +61,7 @@ parser.add_argument('--image_text_folder', type=str, required=True,
 parser.add_argument('--negative_samples_path', type=str, default=None,
                     help='path to your folder of clip embeddings of negative samples')
 
-parser.add_argument(
-    '--wds', 
-    type = str, 
-    default='', 
+parser.add_argument('--wds', type = str, default='', 
     help = 'Comma separated list of WebDataset (1) image and (2) text column names. Must contain 2 values, e.g. img,cap.'
 )
 
@@ -239,7 +239,6 @@ else:
     print(DATASET)
         
 # initialize distributed backend
-
 distr_backend = distributed_utils.set_backend_from_args(args)
 distr_backend.initialize()
 
@@ -404,7 +403,8 @@ else:
         truncate_captions=args.truncate_captions,
         tokenizer=tokenizer,
         shuffle=is_shuffle,
-        negatives_path=args.negative_samples_path
+        negatives_path=args.negative_samples_path,
+        clip_embeddings=not args.inferring_clip_embeddings
     )
     assert len(ds) > 0, 'dataset is empty'
 
@@ -608,15 +608,16 @@ for epoch in range(resume_epoch, EPOCHS):
         data_sampler.set_epoch(epoch)
     for i, batch in enumerate((dl if ENABLE_WEBDATASET else distr_dl)):
         if not USE_NEG_SAMPLES:
-            if not args.inferring_clip_embeddings:
-                (text, images, emb_im, emb_txt) = batch
-            else:
+            if args.inferring_clip_embeddings:
                 (text, images) = batch
                 with torch.no_grad():
                     emb_im = clip_model.encode_image(preprocess(images).to(device))
                     emb_im /= emb_im.norm(dim=-1, keepdim=True)
                     emb_txt = clip_model.encode_text(text[:, :77].to(device))
-                    emb_txt /= emb_txt.norm(dim=-1, keepdim=True) 
+                    emb_txt /= emb_txt.norm(dim=-1, keepdim=True)
+            else:
+                (text, images, emb_im, emb_txt) = batch
+                
         else:
             (text, images, emb_im, emb_txt, fut_clip, neg_clips) = batch
             fut_clip, neg_clips = fut_clip.cuda(), neg_clips.cuda()
@@ -688,7 +689,7 @@ for epoch in range(resume_epoch, EPOCHS):
                 if not avoid_model_calls:
                     # CUDA index errors when we don't guard this
                     
-                    gen_image = warhol.generate_images(emb_im[:1], emb_txt[:1], text[:1], filter_thres=0.9)
+                    gen_image = warhol.generate_images(emb_im[:1], emb_txt[:1], text[:1], filter_thres=0.75)
                     # avg_percept_loss = percept_loss(gen_image, images[:1]).detach().cpu().item()
 
 

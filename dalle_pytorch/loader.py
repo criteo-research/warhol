@@ -17,7 +17,8 @@ class TextImageDataset(Dataset):
                  resize_ratio=0.75,
                  tokenizer=None,
                  negatives_path=None,
-                 shuffle=False
+                 shuffle=False,
+                 clip_embeddings=False
                  ):
         """
         @param folder: Folder containing images and text files matched by their paths' respective "stem"
@@ -25,6 +26,7 @@ class TextImageDataset(Dataset):
         """
         super().__init__()
         self.shuffle = shuffle
+        self.clip_embeddings = clip_embeddings
         path = Path(folder)
 
         text_files = [*path.glob('**/*.txt')]
@@ -32,18 +34,19 @@ class TextImageDataset(Dataset):
             *path.glob('**/*.png'), *path.glob('**/*.jpg'),
             *path.glob('**/*.jpeg'), *path.glob('**/*.bmp')
         ]
-        clip_files = [*path.glob('**/*.npy')]
-
         text_files = {text_file.stem: text_file for text_file in text_files}
         image_files = {image_file.stem: image_file for image_file in image_files}
-        clip_files = {clip_file.stem: clip_file for clip_file in clip_files}
-
-        keys = ((image_files.keys() & text_files.keys()) & clip_files.keys())
-
-        self.keys = list(keys)
+        keys = ((image_files.keys() & text_files.keys()))
         self.text_files = {k: v for k, v in text_files.items() if k in keys}
         self.image_files = {k: v for k, v in image_files.items() if k in keys}
-        self.clip_files = {k: v for k, v in clip_files.items() if k in keys}
+        
+        if clip_embeddings:
+            clip_files = [*path.glob('**/*.npy')]
+            clip_files = {clip_file.stem: clip_file for clip_file in clip_files}
+            keys = ((image_files.keys() & text_files.keys() & clip_files.keys()))
+            self.clip_files = {k: v for k, v in clip_files.items() if k in keys}
+        
+        self.keys = list(keys)
         self.text_len = text_len
         self.truncate_captions = truncate_captions
         self.resize_ratio = resize_ratio
@@ -76,10 +79,8 @@ class TextImageDataset(Dataset):
 
     def __getitem__(self, ind):
         key = self.keys[ind]
-
         text_file = self.text_files[key]
-        image_file = self.image_files[key]
-        clip_file = self.clip_files[key]
+        image_file = self.image_files[key]            
 
         descriptions = text_file.read_text().split('\n')
         descriptions = list(filter(lambda t: len(t) > 0, descriptions))
@@ -102,15 +103,18 @@ class TextImageDataset(Dataset):
             print(f"Skipping index {ind}")
             return self.skip_sample(ind)
         
-        try:
-            clip_array = np.load(clip_file)
-            clip_img = clip_array[:512]
-            clip_txt = clip_array[512:]
-                
-        except:
-            print(f"An exception occurred trying to load file {clip_file}.")
-            print(f"Skipping index {ind}")
-            return self.skip_sample(ind)
+        if self.clip_embeddings:
+            clip_file = self.clip_files[key]
+            try:
+                clip_array = np.load(clip_file)
+                clip_img = clip_array[:512]
+                clip_txt = clip_array[512:]
+
+            except:
+                print(f"An exception occurred trying to load file {clip_file}.")
+                print(f"Skipping index {ind}")
+                return self.skip_sample(ind)
+            
         if self.negative_embeds is not None:
             idx_file = int(str(text_file).split("/")[-1].split(".")[0])
             clip_embeds = self.negative_embeds[idx_file]
@@ -119,7 +123,11 @@ class TextImageDataset(Dataset):
             fut_clip = clip_embeds[1]
             neg_clips = clip_embeds[2:]
 
-        # Success
-        if self.negative_embeds is not None:
+            # Success
             return tokenized_text, image_tensor, past_clip_img, past_clip_txt, fut_clip, neg_clips
-        return tokenized_text, image_tensor, clip_img, clip_txt
+        
+        else:
+            if self.clip_embeddings:
+                return tokenized_text, image_tensor, clip_img, clip_txt
+            else:
+                return tokenized_text, image_tensor
