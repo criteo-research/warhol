@@ -1,5 +1,5 @@
-## ProductGen !
-This is the official repo for Warhol.
+# ProductGen !
+This is the official repo for [Warhol](https://arxiv.org/abs/2109.01093).
 
 ## Setting up the environment !
 Follows the instructions in install_warhol.sh
